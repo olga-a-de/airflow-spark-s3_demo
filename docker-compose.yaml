@@ -1,0 +1,203 @@
+x-airflow-common: &airflow-common
+  image: sandbox-airflow-spark:local
+  networks:
+    - data-network
+  environment:
+    - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres/${POSTGRES_DB}
+    - AIRFLOW__CORE__LOAD_EXAMPLES=False
+    - AIRFLOW__CORE__DAGS_FOLDER=/opt/airflow/dags/repo/dags
+    - AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS=True
+    - AIRFLOW__API_AUTH__JWT_SECRET=sandbox-jwt-secret-key-3.2.2-local-dev-level
+    - AIRFLOW__CORE__FERNET_KEY=7tZ_T_Q3u3R6n2qD2x4G8z1B2c3D4e5F6g7H8i9J0k1=
+    - AIRFLOW__CORE__EXECUTION_API_SERVER_URL=http://sandbox-airflow-webserver:8080/execution/
+    - 'AIRFLOW_CONN_SPARK_DEFAULT={"conn_type": "spark", "host": "spark://spark-master", "port": 7077}'
+    - AIRFLOW_CONN_AWS_DEFAULT=aws://${MINIO_USER}:${MINIO_PASSWORD}@/?endpoint_url=http%3A%2F%2Fminio%3A9000
+    - MINIO_USER=${MINIO_USER}
+    - MINIO_PASSWORD=${MINIO_PASSWORD}
+  volumes:
+    - airflow_dags:/opt/airflow/dags:ro
+    - airflow_logs:/opt/airflow/logs
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: sandbox-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - data-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  minio:
+    image: minio/minio:latest
+    container_name: sandbox-minio
+    ports:
+      - "9000:9000"  
+      - "9011:9011"  
+    environment:
+      MINIO_ROOT_USER: ${MINIO_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_PASSWORD}
+    volumes:
+      - minio_data:/data
+    networks:
+      - data-network
+    command: server /data --console-address ":9011"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  git-sync:
+    image: registry.k8s.io/git-sync/git-sync:v4.2.1
+    container_name: sandbox-airflow-git-sync
+    user: "0:0"
+    restart: always
+    environment:
+      GITSYNC_REPO: ${GIT_SYNC_REPO_URL}
+      GITSYNC_REF: ${GIT_SYNC_BRANCH_NAME}
+      GITSYNC_ROOT: "/git"
+      GITSYNC_LINK: "repo"
+      GITSYNC_PERIOD: "60s"
+    volumes:
+      - airflow_dags:/git
+    networks:
+      - data-network
+
+  airflow-init:
+    <<: *airflow-common
+    container_name: sandbox-airflow-init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: bash -c "airflow db migrate"
+    volumes:
+      - airflow_logs:/opt/airflow/logs
+      - airflow_dags:/opt/airflow/dags:ro
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: sandbox-airflow-webserver
+    restart: always
+    command: api-server
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+    ports:
+      - "8082:8080"
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: sandbox-airflow-scheduler
+    restart: always
+    command: scheduler
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    container_name: sandbox-airflow-dag-processor
+    restart: always
+    command: dag-processor
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: sandbox-airflow-triggerer
+    restart: always
+    command: triggerer
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+
+
+  spark-master:
+    image: bitnamilegacy/spark:3.5.1
+    container_name: sandbox-spark-master
+    ports:
+      - "8089:8080"  
+      - "7077:7077"  
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    volumes:
+      - airflow_dags:/opt/spark/project:ro
+    networks:
+      - data-network
+
+  spark-worker:
+    image: bitnamilegacy/spark:3.5.1
+    container_name: sandbox-spark-worker
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    volumes:
+      - airflow_dags:/opt/spark/project:ro
+    networks:
+      - data-network
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: sandbox-minio-init
+    depends_on:
+      - minio
+    environment:
+      - MINIO_USER=${MINIO_USER}
+      - MINIO_PASSWORD=${MINIO_PASSWORD}
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc alias set local_s3 http://sandbox-minio:9000 $MINIO_USER $MINIO_PASSWORD) do echo 'Waiting for MinIO...' && sleep 1; done;
+      /usr/bin/mc mb local_s3/bronze || true;
+      /usr/bin/mc mb local_s3/silver || true;
+      /usr/bin/mc mb local_s3/gold || true;
+      echo 'All buckets initialized successfully!';
+      exit 0;
+      "
+    networks:
+      - data-network
+
+volumes:
+  minio_data:
+    driver: local
+  postgres_data:
+    driver: local
+  airflow_dags:
+    driver: local
+  airflow_logs:
+    driver: local
+
+networks:
+  data-network:
+    driver: bridge
+    driver_opts:
+      com.docker.network.driver.mtu: "1400"
