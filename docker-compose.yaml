@@ -1,5 +1,6 @@
 x-airflow-common: &airflow-common
   image: sandbox-airflow-spark:local
+  build: .
   networks:
     - data-network
   environment:
