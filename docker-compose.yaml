@@ -1,6 +1,5 @@
 x-airflow-common: &airflow-common
   image: sandbox-airflow-spark:local
-  build: .
   networks:
     - data-network
   environment:
@@ -75,6 +74,7 @@ services:
 
   airflow-init:
     <<: *airflow-common
+    build: .
     container_name: sandbox-airflow-init
     depends_on:
       postgres:
